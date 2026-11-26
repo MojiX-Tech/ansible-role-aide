@@ -1,0 +1,112 @@
+---
+- name: Debian or Ubuntu only
+  ansible.builtin.assert:
+    that: ansible_facts['os_family'] == 'Debian'
+    fail_msg: "The role aide supports Debian and Ubuntu, not {{ ansible_facts['distribution'] }}."
+    quiet: true
+  tags: [always]
+
+- name: Install AIDE
+  ansible.builtin.apt:
+    name: "{{ aide_packages }}"
+    state: present
+    install_recommends: false
+    update_cache: true
+    cache_valid_time: 3600
+  tags: [aide_install]
+
+- name: AIDE configuration (lean baseline)
+  ansible.builtin.template:
+    src: aide-lean.conf.j2
+    dest: "{{ aide_config }}"
+    owner: root
+    group: root
+    mode: "0640"
+    validate: /usr/bin/aide --config-check --config %s
+  register: aide_config_result
+  tags: [aide_config]
+
+- name: Check for /etc/default/aide
+  ansible.builtin.stat:
+    path: /etc/default/aide
+    get_checksum: false
+  register: aide_default_stat
+  tags: [aide_config]
+
+- name: Distribution's daily AIDE check off (cron.daily)
+  ansible.builtin.lineinfile:
+    path: /etc/default/aide
+    regexp: '^#?\s*CRON_DAILY_RUN='
+    line: 'CRON_DAILY_RUN=no    # aide role: one weekly run by /usr/local/bin/aide-report'
+  when:
+    - aide_disable_distribution_check | bool
+    - aide_default_stat.stat.exists
+  tags: [aide_config]
+
+- name: Check for the distribution's daily AIDE timer
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - /usr/lib/systemd/system/dailyaidecheck.timer
+    - /lib/systemd/system/dailyaidecheck.timer
+  register: aide_daily_timer_stat
+  tags: [aide_config]
+
+- name: Distribution's daily AIDE check off (systemd timer)
+  ansible.builtin.systemd:
+    name: dailyaidecheck.timer
+    state: stopped
+    enabled: false
+    masked: true
+  when:
+    - aide_disable_distribution_check | bool
+    - aide_daily_timer_stat.results | selectattr('stat.exists') | list | length > 0
+  tags: [aide_config]
+
+# The weekly run starts from root's crontab; a minimal system has no cron.
+- name: Install cron
+  ansible.builtin.apt:
+    name: "{{ aide_report_packages }}"
+    state: present
+    install_recommends: false
+  when: aide_report_enabled | bool
+  tags: [aide_install, aide_report]
+
+- name: Weekly report script
+  ansible.builtin.template:
+    src: aide-report.sh.j2
+    dest: /usr/local/bin/aide-report
+    owner: root
+    group: root
+    mode: "0750"
+  tags: [aide_report]
+
+- name: Weekly report by mail
+  ansible.builtin.cron:
+    name: Weekly AIDE report - file changes that no package update explains by mail
+    weekday: "{{ aide_report_weekday }}"
+    hour: "{{ aide_report_hour }}"
+    minute: "{{ aide_report_minute }}"
+    job: /usr/local/bin/aide-report > /dev/null
+    state: "{{ 'present' if aide_report_enabled | bool else 'absent' }}"
+  tags: [aide_report]
+
+# Baseline: the first one, and a new one whenever the configuration changed -
+# the next run would otherwise report every entry that left or joined the
+# watched set. (Later baselines are written by the weekly run.)
+# LAST task: everything the role itself changes (crontab, /etc/default/aide,
+# the report script) must be part of the baseline.
+- name: Check for the baseline
+  ansible.builtin.stat:
+    path: "{{ aide_db }}"
+  register: aide_db_stat
+  tags: [aide_config, aide_report]
+
+- name: Baseline (the first one, or after a change of the configuration)
+  ansible.builtin.command: /usr/local/bin/aide-report --init
+  when: not aide_db_stat.stat.exists or (aide_config_result is changed)
+  changed_when: true
+  async: 3600
+  poll: 10
+  tags: [aide_config, aide_report]

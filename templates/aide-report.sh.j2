@@ -1,0 +1,213 @@
+#!/bin/bash
+# Managed by Ansible (role aide) - local changes are overwritten
+
+# =================================================
+# Weekly AIDE report
+#
+# Compares the system files with the baseline and sends ONE mail, and only
+# when something is notable:
+#   - a file was added, removed or changed and NO package update of the week
+#     explains it (changed file = exactly what an updated package ships)
+#   - AIDE itself failed
+# After the run the new state becomes the baseline, so every change is
+# reported once. The full AIDE report of each run stays in
+# {{ aide_report_log }} (+ .1).
+#
+#   aide-report            weekly run (cron)
+#   aide-report --init     new baseline without a comparison (after a change
+#                          of the watched paths or excludes), no mail
+# =================================================
+
+email_address='{{ aide_report_email }}'
+email_subject="[AIDE] Weekly Report - $(hostname -f)"
+
+config='{{ aide_config }}'
+db='{{ aide_db }}'
+db_new='{{ aide_db | regex_replace('\.gz$', '') }}.new.gz'
+db_keep={{ aide_db_keep }}
+report_log='{{ aide_report_log }}'
+run_timeout='{{ aide_run_timeout }}'
+
+date_time=$(date +"%Y-%m-%d %T")
+work=$(mktemp -d /tmp/aide-report.XXXXXX)
+trap 'rm -rf "${work}"' EXIT
+
+# One run at a time
+exec 9> /run/lock/aide-report.lock
+if ! flock -n 9; then echo "[AIDE] Another aide-report is running - nothing done"; exit 0; fi
+
+# lowest CPU and disk priority - the check never competes with the services
+aide_cmd="timeout ${run_timeout} nice -n 19 ionice -c 3 /usr/bin/aide --config ${config}"
+
+send_mail() {
+    if ! command -v mail > /dev/null 2>&1; then
+        echo "[ERROR] No 'mail' command on this host - the report cannot be sent" >&2
+        return 1
+    fi
+    echo "[AIDE] Send the report to '${email_address}'"
+    if ! mail -s "${email_subject}" "${email_address}" < "${work}/mail.txt"; then
+        echo "[ERROR] Sending the report to '${email_address}' failed" >&2
+        return 1
+    fi
+}
+
+# The new state becomes the baseline; the last ${db_keep} old ones are kept
+roll_baseline() {
+    if [ ! -s "${db_new}" ]; then return 1; fi
+    if [ -f "${db}" ]; then cp -p "${db}" "${db%.gz}.$(date +%Y%m%d-%H%M).gz"; fi
+    mv -f "${db_new}" "${db}"
+    # shellcheck disable=SC2012
+    ls -1t "${db%.gz}".2*.gz 2>/dev/null | tail -n +$(( db_keep + 1 )) | xargs -r rm -f
+}
+
+mkdir -p "$(dirname "${report_log}")"
+
+# ----------------------
+# Baseline only
+# ----------------------
+
+if [ "$1" = '--init' ] || [ ! -f "${db}" ]; then
+    echo "[AIDE] Create the baseline ${db}"
+    ${aide_cmd} --init > "${work}/aide.txt" 2>&1
+    result=$?
+    if [ ${result} -ne 0 ] || ! roll_baseline; then
+        echo "[ERROR] aide --init failed (exit code ${result})" >&2
+        tail -n 20 "${work}/aide.txt" >&2
+        exit 1
+    fi
+    grep -E 'Number of entries|Total number of entries' "${work}/aide.txt"
+    exit 0
+fi
+
+# ----------------------
+# Compare
+# ----------------------
+
+baseline_time=$(stat -c %Y "${db}")
+
+${aide_cmd} --update > "${work}/aide.txt" 2>&1
+result=$?
+
+if [ -f "${report_log}" ]; then mv -f "${report_log}" "${report_log}.1"; fi
+cp "${work}/aide.txt" "${report_log}"; chmod 640 "${report_log}"
+
+# Exit code: 0 = no differences, bits 1/2/4 = added/removed/changed, 14+ = error
+if [ ${result} -ge 14 ]; then
+    email_subject="[AIDE] FAILED - $(hostname -f)"
+    {
+        echo "Weekly Report of AIDE"
+        echo "====================="
+        echo "Host: $(hostname -f)"
+        echo "Date: ${date_time}"
+        echo ""
+        echo "!! AIDE failed with exit code ${result} (124 = stopped after ${run_timeout}) - nothing was compared"
+        echo ""
+        tail -n 30 "${work}/aide.txt"
+    } > "${work}/mail.txt"
+    send_mail
+    exit 1
+fi
+
+# section <TAB> flags <TAB> path, from the three entry lists of the report
+awk '
+    /^Added entries:/                       { section = "added";   next }
+    /^Removed entries:/                     { section = "removed"; next }
+    /^Changed entries:/                     { section = "changed"; next }
+    /^Detailed information about changes:/  { section = "";        next }
+    /^The attributes of the/                { section = "" }
+    section != "" && match($0, /: \//)      { print section "\t" substr($0, 1, RSTART - 1) "\t" substr($0, RSTART + 2) }
+' "${work}/aide.txt" > "${work}/entries.tsv"
+
+# Packages installed, upgraded or removed since the baseline, and what they ship:
+#   pkg.md5 = path <TAB> md5 of every file (and configuration file) of these packages
+#   pkg.own = every path of these packages (directories, links)
+# /bin, /sbin, /lib* are links into /usr - the lists may name either.
+since=$(date -d "@${baseline_time}" +"%F %T")
+packages=$(cat /var/log/dpkg.log.1 /var/log/dpkg.log 2>/dev/null | awk -v since="${since}" '($1 " " $2) >= since && $3 ~ /^(install|upgrade|remove|purge)$/ { split($4, p, ":"); print p[1] }' | sort -u)
+: > "${work}/pkg.md5"; : > "${work}/pkg.own"
+merged='s#^/(bin|sbin|lib|lib32|lib64|libx32)/#/usr/\1/#'
+for package in ${packages}; do
+    for file in "/var/lib/dpkg/info/${package}.md5sums" "/var/lib/dpkg/info/${package}":*.md5sums; do
+        [ -f "${file}" ] && sed -E 's#^([0-9a-f]+) +(.*)$#/\2\t\1#' "${file}" | sed -E "${merged}" >> "${work}/pkg.md5"
+    done
+    for file in "/var/lib/dpkg/info/${package}.list" "/var/lib/dpkg/info/${package}":*.list; do
+        [ -f "${file}" ] && sed -E "${merged}" "${file}" >> "${work}/pkg.own"
+    done
+    # shellcheck disable=SC2016
+    dpkg-query -W -f='${Conffiles}\n' "${package}" 2>/dev/null | awk 'NF >= 2 { print $1 "\t" $2 }' >> "${work}/pkg.md5"
+done
+
+# A change is explained by a package update when
+#   - a file's content is exactly what one of these packages ships
+#   - a directory or link belongs to one of these packages
+#   - a removed path lies outside /etc, /root, /var (old kernels, old libraries)
+: > "${work}/explained.tsv"; : > "${work}/notable.tsv"
+while IFS=$'\t' read -r section flags path; do
+    target="${work}/notable.tsv"
+    if [ -n "${packages}" ]; then
+        if [ "${section}" = 'removed' ]; then
+            case "${path}" in /etc/*|/root/*|/var/*) ;; *) target="${work}/explained.tsv" ;; esac
+        elif [ -f "${path}" ] && [ ! -L "${path}" ]; then
+            shipped=$(awk -F'\t' -v p="${path}" '$1 == p { print $2; exit }' "${work}/pkg.md5")
+            if [ -n "${shipped}" ] && [ "$(md5sum < "${path}" | cut -d' ' -f1)" = "${shipped}" ]; then target="${work}/explained.tsv"; fi
+        elif grep -qxF -- "${path}" "${work}/pkg.own"; then
+            target="${work}/explained.tsv"
+        fi
+    fi
+    printf '%s\t%s\t%s\n' "${section}" "${flags}" "${path}" >> "${target}"
+done < "${work}/entries.tsv"
+
+total=$(wc -l < "${work}/entries.tsv")
+explained=$(wc -l < "${work}/explained.tsv")
+notable=$(wc -l < "${work}/notable.tsv")
+package_list=$(echo ${packages} | cut -c1-300)
+
+roll_baseline || echo "[ERROR] AIDE wrote no new baseline (${db_new})" >&2
+
+if [ "${notable}" -eq 0 ]; then
+    if [ "${total}" -eq 0 ]; then
+        echo "[AIDE] No changes - no mail"
+    else
+        echo "[AIDE] ${total} changed entries, all explained by package updates (${package_list}) - no mail"
+    fi
+    exit 0
+fi
+
+# ----------------------
+# Report
+# ----------------------
+
+{
+    echo "Weekly Report of AIDE"
+    echo "====================="
+    echo "Host: $(hostname -f)"
+    echo "Date: ${date_time}"
+    echo "Compared with the baseline of: ${since}"
+    echo ""
+    echo "${notable} changes that no package update explains"
+    if [ -n "${packages}" ]; then
+        echo "(${total} in total, ${explained} belong to updated packages: ${package_list})"
+    else
+        echo "(no package was installed, updated or removed since the baseline)"
+    fi
+    echo ""
+    for section in added removed changed; do
+        count=$(awk -F'\t' -v s="${section}" '$1 == s' "${work}/notable.tsv" | wc -l)
+        if [ "${count}" -eq 0 ]; then continue; fi
+        title="$(echo "${section}" | sed 's/^./\U&/') (${count})"
+        echo "${title}"
+        echo "${title//?/-}"
+        awk -F'\t' -v s="${section}" '$1 == s { print $2 ": " $3 }' "${work}/notable.tsv" | head -n 300
+        if [ "${count}" -gt 300 ]; then echo "... $(( count - 300 )) more"; fi
+        echo ""
+    done
+    echo "What changed per file (attributes, checksums): ${report_log} on the host"
+    echo "These changes are now part of the baseline and are not reported again."
+} > "${work}/mail.txt"
+
+# ----------------------
+# Send
+# ----------------------
+send_mail || exit 1
+
+exit 0

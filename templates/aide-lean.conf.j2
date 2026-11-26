@@ -1,0 +1,28 @@
+# Managed by Ansible (role aide) - local changes are overwritten
+
+# Lean AIDE baseline - the SYSTEM, not the data and not the services:
+# programs, libraries, configuration, boot files, root's keys and crontabs.
+# Run by /usr/local/bin/aide-report (weekly); by hand:
+#   aide --config {{ aide_config }} --check
+
+database_in=file:{{ aide_db }}
+database_out=file:{{ aide_db | regex_replace('\.gz$', '') }}.new.gz
+gzip_dbout=yes
+
+report_summarize_changes=yes
+report_grouped=yes
+report_level=changed_attributes
+log_level=warning
+
+# permissions, owner, group, type, link target, capabilities, content
+Lean = {{ aide_attributes }}
+
+## Not watched (change by themselves / generated)
+{% for e in aide_excludes + aide_extra_excludes %}
+!{{ e }}
+{% endfor %}
+
+## Watched
+{% for p in aide_paths + aide_extra_paths %}
+{{ p }} Lean
+{% endfor %}

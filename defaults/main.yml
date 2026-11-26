@@ -1,0 +1,80 @@
+---
+# Packages that are installed
+aide_packages:
+  - aide
+  - aide-common
+
+# Lean AIDE baseline: the SYSTEM (programs, libraries, configuration, boot
+# files, root's keys and crontabs), not the data and not the services.
+# Own configuration and own database - the distribution's /etc/aide/aide.conf
+# with its many rule files and checksums stays untouched and unused.
+aide_config: /etc/aide/aide-lean.conf
+aide_db: /var/lib/aide/aide-lean.db.gz
+aide_db_keep: 3     # older baselines kept beside the current one
+aide_report_log: /var/log/aide/aide-lean-report.log
+
+# What is compared per entry: permissions, owner, group, file type, link
+# target, capabilities and the SHA-256 of the content. No mtime, ctime or
+# inode: they change with every package update and say nothing the checksum
+# does not.
+aide_attributes: p+u+g+ftype+l+caps+sha256
+
+# Watched trees (regular expressions, anchored at the start; a path that does
+# not exist on a host simply matches nothing).
+aide_paths:
+  - /boot
+  - /etc
+  - /usr/bin
+  - /usr/sbin
+  - /usr/lib     # also lib32, lib64, libexec
+  - /usr/local/bin
+  - /usr/local/sbin
+  - /bin
+  - /sbin
+  - /lib
+  - /root/\.ssh
+  - /root/\.(profile|bashrc|bash_profile|bash_login|zshrc|zshenv)$
+  - /var/spool/cron
+
+# Files that change by themselves or are generated from other watched files.
+aide_excludes:
+  - /etc/mtab$
+  - /etc/adjtime$
+  - /etc/fake-hwclock\.data$
+  - /etc/\.pwd\.lock$
+  - /etc/ld\.so\.cache$     # ldconfig, every library update
+  - /etc/udev/hwdb\.bin$
+  - /etc/lvm/(archive|backup|cache)
+  - /etc/systemd/system/snap[-.]     # Ubuntu: units of snaps, rewritten at every snap refresh
+  - /etc/systemd/system/[^/]+\.wants/snap[-.]
+  - /etc/letsencrypt/(archive|live|csr|keys|renewal)     # every renewal
+  - /root/\.ssh/known_hosts(\.old)?$     # written by every ssh to a new host
+  - /boot/initrd\.img-     # update-initramfs
+  - /boot/grub/grubenv$
+  - /usr/lib.*/__pycache__     # compiled Python, rebuilt at will
+  - /usr/lib/modules/[^/]+/modules\.[^/]+$     # depmod
+  - /usr/lib/udev/hwdb\.bin$
+  - /usr/lib/locale/locale-archive$
+
+# Additions per host or group, e.g. on a Kubernetes node
+#   aide_extra_paths: [/opt/cni/bin]
+#   aide_extra_excludes: [/etc/cni/net\.d]
+aide_extra_paths: []
+aide_extra_excludes: []
+
+# The distribution runs its own check every night with its full rule set.
+# true = that check is switched off (cron.daily and the systemd timer).
+aide_disable_distribution_check: true
+
+# Weekly report /usr/local/bin/aide-report.
+# ONE mail, and only when a change is NOT explained by a package update of the
+# week (or when AIDE failed). The new state then becomes the baseline.
+# The host must be able to send mail with "mail".
+aide_report_enabled: true
+aide_report_packages:
+  - cron
+aide_report_email: root
+aide_report_weekday: "0"
+aide_report_hour: "11"
+aide_report_minute: "{{ 59 | random(seed=inventory_hostname) }}"     # spreads the hosts over the hour
+aide_run_timeout: 2h
