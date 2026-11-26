@@ -1,0 +1,68 @@
+---
+argument_specs:
+  main:
+    short_description: Lean file integrity check with one weekly mail
+    description:
+      - Watches the system files and compares them with a baseline once a week.
+      - Sends one mail, and only for changes that no package update explains.
+    options:
+      aide_packages:
+        type: list
+        elements: str
+        description: Packages that are installed.
+      aide_config:
+        type: str
+        description: Configuration file of the role.
+      aide_db:
+        type: str
+        description: Baseline database of the role.
+      aide_db_keep:
+        type: int
+        description: Number of older baselines that are kept.
+      aide_report_log:
+        type: str
+        description: Full report of the last run.
+      aide_attributes:
+        type: str
+        description: What is compared per entry.
+      aide_paths:
+        type: list
+        elements: str
+        description: Watched trees (regular expressions).
+      aide_excludes:
+        type: list
+        elements: str
+        description: Paths that are left out (regular expressions).
+      aide_extra_paths:
+        type: list
+        elements: str
+        description: More paths to watch.
+      aide_extra_excludes:
+        type: list
+        elements: str
+        description: More paths to leave out.
+      aide_disable_distribution_check:
+        type: bool
+        description: Switch the distribution's nightly run off.
+      aide_report_enabled:
+        type: bool
+        description: Weekly run on or off.
+      aide_report_packages:
+        type: list
+        elements: str
+        description: Packages the weekly run needs.
+      aide_report_email:
+        type: str
+        description: Receiver of the weekly mail.
+      aide_report_weekday:
+        type: str
+        description: Day of the week of the run (crontab form).
+      aide_report_hour:
+        type: str
+        description: Hour of the run (crontab form).
+      aide_report_minute:
+        type: str
+        description: Minute of the run (crontab form).
+      aide_run_timeout:
+        type: str
+        description: A run is stopped after this time.
